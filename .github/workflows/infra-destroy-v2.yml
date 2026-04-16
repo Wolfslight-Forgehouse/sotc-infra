@@ -1,0 +1,128 @@
+name: "Terraform Destroy"
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type DESTROY to confirm"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  destroy:
+    name: "Terraform Destroy"
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.OTC_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.OTC_SECRET_KEY }}
+      TF_VAR_access_key: ${{ secrets.OTC_ACCESS_KEY }}
+      TF_VAR_secret_key: ${{ secrets.OTC_SECRET_KEY }}
+      TF_VAR_project_id: ${{ secrets.OTC_PROJECT_ID }}
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+      TF_VAR_rke2_token: ${{ secrets.RKE2_TOKEN }}
+      TF_VAR_ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }}
+      TF_VAR_ghcr_pull_token: ${{ secrets.GHCR_PULL_TOKEN }}
+      TF_VAR_github_runner_token: ""
+    defaults:
+      run:
+        working-directory: terraform/environments/dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.OBS_TFSTATE_BUCKET }}" \
+            -backend-config="access_key=${{ secrets.OTC_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.OTC_SECRET_KEY }}" 
+
+      - name: Pre-Destroy - Delete CCM ELBs via OTC API
+        if: github.event.inputs.confirm == 'DESTROY'
+        continue-on-error: true
+        env:
+          OTC_USERNAME:    ${{ secrets.OTC_USERNAME }}
+          OTC_PASSWORD:    ${{ secrets.OTC_PASSWORD }}
+          OTC_DOMAIN_NAME: ${{ secrets.OTC_DOMAIN_NAME }}
+          OTC_PROJECT_ID:  ${{ secrets.OTC_PROJECT_ID }}
+          OTC_ACCESS_KEY:  ${{ secrets.OTC_ACCESS_KEY }}
+          OTC_SECRET_KEY:  ${{ secrets.OTC_SECRET_KEY }}
+        run: |
+          # IAM Token holen
+          echo "🔑 Getting IAM token for user=${OTC_USERNAME} domain=${OTC_DOMAIN_NAME} project=${OTC_PROJECT_ID}"
+          HTTP_RESP=$(curl -s -X POST \
+            "https://iam-pub.eu-ch2.sc.otc.t-systems.com/v3/auth/tokens" \
+            -H "Content-Type: application/json" \
+            -D /tmp/iam-headers.txt \
+            -d '{"auth":{"identity":{"methods":["password"],"password":{"user":{"name":"'"${OTC_USERNAME}"'","password":"'"${OTC_PASSWORD}"'","domain":{"name":"'"${OTC_DOMAIN_NAME}"'"}}}},"scope":{"project":{"id":"'"${OTC_PROJECT_ID}"'"}}}}' \
+            -w "%{http_code}" -o /tmp/iam-body.txt 2>/dev/null)
+          echo "  IAM HTTP status: $HTTP_RESP"
+          if [ "$HTTP_RESP" != "201" ]; then
+            echo "  IAM error: $(cat /tmp/iam-body.txt 2>/dev/null | head -1)"
+          fi
+          TOKEN=$(grep -i "x-subject-token" /tmp/iam-headers.txt 2>/dev/null | awk '{print $2}' | tr -d '\r')
+
+          if [ -z "$TOKEN" ]; then
+            echo "⚠️ Could not get IAM token — skipping ELB cleanup"
+            exit 0
+          fi
+          echo "✅ IAM token obtained"
+
+          ELB_EP="https://elb.eu-ch2.sc.otc.t-systems.com/v3/${OTC_PROJECT_ID}/elb"
+
+          # Alle k8s-managed ELBs finden
+          ELBS=$(curl -sf -H "X-Auth-Token: $TOKEN" "$ELB_EP/loadbalancers?limit=100" 2>/dev/null | \
+            python3 -c "import sys,json; [print(e['id'],e['name']) for e in json.load(sys.stdin).get('loadbalancers',[]) if e.get('name','').startswith('k8s-kubernetes-')]" || true)
+
+          [ -z "$ELBS" ] && echo "✅ No CCM ELBs found" && exit 0
+          echo "Found CCM ELBs:"; echo "$ELBS"
+
+          echo "$ELBS" | while read ELB_ID ELB_NAME; do
+            echo "=== Cleaning $ELB_NAME ($ELB_ID) ==="
+            LISTENERS=$(curl -sf -H "X-Auth-Token: $TOKEN" \
+              "$ELB_EP/listeners?loadbalancer_id=$ELB_ID" 2>/dev/null | \
+              python3 -c "import sys,json;[print(l['id']) for l in json.load(sys.stdin).get('listeners',[])]" || true)
+
+            for L_ID in $LISTENERS; do
+              POOL_ID=$(curl -sf -H "X-Auth-Token: $TOKEN" "$ELB_EP/listeners/$L_ID" 2>/dev/null | \
+                python3 -c "import sys,json; p=json.load(sys.stdin).get('listener',{}).get('default_pool_id',''); print(p if p and p!='null' else '')" || true)
+
+              if [ -n "$POOL_ID" ]; then
+                HM_ID=$(curl -sf -H "X-Auth-Token: $TOKEN" "$ELB_EP/pools/$POOL_ID" 2>/dev/null | \
+                  python3 -c "import sys,json; print(json.load(sys.stdin).get('pool',{}).get('healthmonitor_id','') or '')" || true)
+                MEMBERS=$(curl -sf -H "X-Auth-Token: $TOKEN" "$ELB_EP/pools/$POOL_ID/members" 2>/dev/null | \
+                  python3 -c "import sys,json;[print(m['id']) for m in json.load(sys.stdin).get('members',[])]" || true)
+                for M in $MEMBERS; do
+                  curl -sf -X DELETE -H "X-Auth-Token: $TOKEN" "$ELB_EP/pools/$POOL_ID/members/$M" && echo "  ✓ member $M"
+                done
+                [ -n "$HM_ID" ] && curl -sf -X DELETE -H "X-Auth-Token: $TOKEN" "$ELB_EP/healthmonitors/$HM_ID" && echo "  ✓ healthmonitor $HM_ID"
+                curl -sf -X DELETE -H "X-Auth-Token: $TOKEN" "$ELB_EP/pools/$POOL_ID" && echo "  ✓ pool $POOL_ID"
+              fi
+              curl -sf -X DELETE -H "X-Auth-Token: $TOKEN" "$ELB_EP/listeners/$L_ID" && echo "  ✓ listener $L_ID"
+            done
+
+            sleep 5
+            curl -sf -X DELETE -H "X-Auth-Token: $TOKEN" "$ELB_EP/loadbalancers/$ELB_ID" \
+              && echo "✅ ELB $ELB_NAME deleted" || echo "⚠️ ELB delete failed"
+          done
+          sleep 20
+          echo "✅ ELB cleanup done"
+
+      - name: Terraform Destroy
+        if: github.event.inputs.confirm == 'DESTROY'
+        run: terraform destroy -auto-approve

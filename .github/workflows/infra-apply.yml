@@ -1,0 +1,763 @@
+name: "Terraform Apply"
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type APPLY to confirm deployment"
+        required: true
+
+permissions:
+  contents: read
+
+# ─────────────────────────────────────────────────────────
+# JOB 1: Terraform — provision OTC infrastructure
+# ─────────────────────────────────────────────────────────
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  apply:
+    name: "Terraform Apply"
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.event.inputs.confirm == 'APPLY'
+    defaults:
+      run:
+        working-directory: terraform/environments/dev
+    env:
+      # OBS backend credentials (S3-compatible)
+      AWS_ACCESS_KEY_ID:     ${{ secrets.OTC_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.OTC_SECRET_KEY }}
+      # Terraform variables
+      TF_VAR_access_key:          ${{ secrets.OTC_ACCESS_KEY }}
+      TF_VAR_secret_key:          ${{ secrets.OTC_SECRET_KEY }}
+      TF_VAR_project_id:          ${{ secrets.OTC_PROJECT_ID }}
+      TF_VAR_ssh_public_key:      ${{ secrets.SSH_PUBLIC_KEY }}
+      TF_VAR_rke2_token:          ${{ secrets.RKE2_TOKEN }}
+      TF_VAR_ghcr_pull_token:     ${{ secrets.GHCR_PULL_TOKEN }}
+      # Optional — empty defaults
+      TF_VAR_domain_name:         ""
+      TF_VAR_project_name:        ""
+      TF_VAR_github_runner_token: ""
+      TF_VAR_gitlab_url:          ""
+      TF_VAR_gitlab_runner_token: ""
+      # SSH private key for Terraform provisioner (if needed)
+      TF_VAR_ssh_private_key: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+          terraform_wrapper: false
+
+      # Init: pass OBS credentials explicitly via -backend-config
+      # (AWS_* env vars work for OBS but only when skip flags are set in backend.tf)
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.OBS_TFSTATE_BUCKET }}" \
+            -backend-config="access_key=${{ secrets.OTC_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.OTC_SECRET_KEY }}"
+
+      - name: Terraform Plan
+        run: terraform plan -no-color
+
+      - name: Terraform Apply
+        id: tf-apply
+        run: |
+          terraform apply -auto-approve -no-color
+          # Capture outputs for downstream jobs
+          echo "master_ip=$(terraform output -raw master_ip)"                   >> $GITHUB_OUTPUT
+          echo "bastion_ip=$(terraform output -raw bastion_ip)"                 >> $GITHUB_OUTPUT
+          echo "bastion_private_ip=$(terraform output -raw bastion_private_ip)" >> $GITHUB_OUTPUT
+          echo "vpc_id=$(terraform output -raw vpc_id)"                         >> $GITHUB_OUTPUT
+          echo "subnet_id=$(terraform output -raw subnet_id)"                   >> $GITHUB_OUTPUT
+          echo "subnet_network_id=$(terraform output -raw subnet_network_id)"   >> $GITHUB_OUTPUT
+          echo "security_group_id=$(terraform output -raw security_group_id)"   >> $GITHUB_OUTPUT
+          echo "worker_ips_json=$(terraform output -raw worker_ips_json)"          >> $GITHUB_OUTPUT
+          echo "shared_elb_id=$(terraform output -raw shared_elb_id 2>/dev/null || echo '')"   >> $GITHUB_OUTPUT
+          echo "shared_elb_ip=$(terraform output -raw shared_elb_public_ip 2>/dev/null || echo '')" >> $GITHUB_OUTPUT
+          echo "ccm_elb_eip=$(terraform output -raw ccm_elb_eip_enabled 2>/dev/null || echo 'true')" >> $GITHUB_OUTPUT
+          echo "deploy_ingress=$(terraform output -raw deploy_ingress_nginx 2>/dev/null || echo 'true')" >> $GITHUB_OUTPUT
+
+    outputs:
+      master_ip:          ${{ steps.tf-apply.outputs.master_ip }}
+      bastion_ip:         ${{ steps.tf-apply.outputs.bastion_ip }}
+      bastion_private_ip: ${{ steps.tf-apply.outputs.bastion_private_ip }}
+      vpc_id:             ${{ steps.tf-apply.outputs.vpc_id }}
+      subnet_id:          ${{ steps.tf-apply.outputs.subnet_id }}
+      subnet_network_id:  ${{ steps.tf-apply.outputs.subnet_network_id }}
+      security_group_id:  ${{ steps.tf-apply.outputs.security_group_id }}
+      worker_ips_json:    ${{ steps.tf-apply.outputs.worker_ips_json }}
+      shared_elb_id:      ${{ steps.tf-apply.outputs.shared_elb_id }}
+      shared_elb_ip:      ${{ steps.tf-apply.outputs.shared_elb_ip }}
+      ccm_elb_eip:        ${{ steps.tf-apply.outputs.ccm_elb_eip }}
+      deploy_ingress:     ${{ steps.tf-apply.outputs.deploy_ingress }}
+
+# ─────────────────────────────────────────────────────────
+# JOB 2: Post-Apply — kubeconfig, CCM, Demo App
+# ─────────────────────────────────────────────────────────
+  post-apply:
+    name: "Post-Apply: CCM + Demo App"
+    needs: apply
+    runs-on: ubuntu-latest
+    if: success()
+    env:
+      BASTION_IP: ${{ needs.apply.outputs.bastion_ip }}
+      MASTER_IP:  ${{ needs.apply.outputs.master_ip }}
+      VPC_ID:     ${{ needs.apply.outputs.vpc_id }}
+      SUBNET_ID:  ${{ needs.apply.outputs.subnet_network_id }}
+      NETWORK_ID:        ${{ needs.apply.outputs.subnet_id }}
+      WORKER_IPS_JSON:   ${{ needs.apply.outputs.worker_ips_json }}
+      SHARED_ELB_ID:     ${{ needs.apply.outputs.shared_elb_id }}
+      SHARED_ELB_IP:     ${{ needs.apply.outputs.shared_elb_ip }}
+      CCM_ELB_EIP:       ${{ needs.apply.outputs.ccm_elb_eip }}
+      DEPLOY_INGRESS:    ${{ needs.apply.outputs.deploy_ingress }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── SSH Setup ──────────────────────────────────────
+      # Problem history:
+      #   - "Host key verification failed" → fixed by ssh-keyscan
+      #   - "Permission denied (publickey)" → key had surrounding quotes in 1Password
+      #   - "is not a key file" → printf strips newlines; echo also unreliable
+      # Solution: store key base64-encoded as SSH_PRIVATE_KEY_B64 secret
+      #   → base64 -d perfectly restores multiline PEM with all newlines intact
+      - name: Setup SSH agent
+        env:
+          SSH_PRIVATE_KEY_B64: ${{ secrets.SSH_PRIVATE_KEY_B64 }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Decode base64 → multiline PEM preserved across all runner environments
+          echo "$SSH_PRIVATE_KEY_B64" | base64 -d > ~/.ssh/rke2-key
+          chmod 600 ~/.ssh/rke2-key
+
+          # Validate key is usable (fails fast if secret is misconfigured)
+          ssh-keygen -y -f ~/.ssh/rke2-key > ~/.ssh/rke2-key.pub || {
+            echo "❌ SSH key invalid — check SSH_PRIVATE_KEY_B64 secret"
+            exit 1
+          }
+          echo "✅ SSH key fingerprint: $(ssh-keygen -l -f ~/.ssh/rke2-key)"
+
+          # Pre-scan bastion host key → eliminates "Host key verification failed"
+          # Retry up to 3x in case bastion is still booting
+          for i in 1 2 3; do
+            ssh-keyscan -T 15 -H "$BASTION_IP" >> ~/.ssh/known_hosts 2>/dev/null && break
+            echo "  ssh-keyscan attempt $i failed, retrying..."
+            sleep 10
+          done
+          echo "✅ Bastion host key added to known_hosts"
+
+          # SSH config: use rke2-key for all OTC hosts, skip host checking for internal IPs
+          cat >> ~/.ssh/config << EOF
+          Host $BASTION_IP
+            IdentityFile ~/.ssh/rke2-key
+            StrictHostKeyChecking accept-new
+            ConnectTimeout 10
+
+          Host 10.0.*.*
+            IdentityFile ~/.ssh/rke2-key
+            StrictHostKeyChecking no
+            ProxyJump ubuntu@$BASTION_IP
+            ConnectTimeout 15
+          EOF
+          chmod 600 ~/.ssh/config
+
+      # ── Wait for RKE2 ──────────────────────────────────
+      - name: Install geesefs on all nodes (via SCP over Bastion)
+        continue-on-error: true
+        env:
+          OTC_ACCESS_KEY: ${{ secrets.OTC_ACCESS_KEY }}
+          OTC_SECRET_KEY: ${{ secrets.OTC_SECRET_KEY }}
+        run: |
+          KEY=~/.ssh/rke2-key   # gleicher Pfad wie SSH Setup Step
+          GEESEFS_VERSION="v0.42.4"
+          GEESEFS_URL="https://obs.eu-ch2.sc.otc.t-systems.com/${{ secrets.OBS_TFSTATE_BUCKET }}/binaries/geesefs-linux-amd64-${GEESEFS_VERSION}"
+
+          echo "⬇️  Downloading geesefs ${GEESEFS_VERSION} from OBS to runner..."
+          HTTP=$(curl -sf \
+            --aws-sigv4 "aws:amz:eu-ch2:s3" \
+            --user "${OTC_ACCESS_KEY}:${OTC_SECRET_KEY}" \
+            -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+            -w "%{http_code}" \
+            "$GEESEFS_URL" \
+            -o /tmp/geesefs 2>/dev/null)
+          if [ "$HTTP" = "200" ] && [ -s /tmp/geesefs ]; then
+            chmod +x /tmp/geesefs
+            echo "✅ geesefs downloaded ($(du -sh /tmp/geesefs | cut -f1))"
+          else
+            echo "❌ geesefs download failed (HTTP $HTTP) — skipping node install"
+            exit 0
+          fi
+
+          # Hilfsfunktion: geesefs auf Node installieren (via Bastion als ProxyJump)
+          install_geesefs() {
+            local NODE_IP=$1
+            echo "📦 Installing geesefs on ${NODE_IP}..."
+            # Key auf Bastion hochladen (einmalig, idempotent)
+            scp -o StrictHostKeyChecking=no -i "$KEY" "$KEY" ubuntu@${BASTION_IP}:/tmp/rke2-key 2>/dev/null
+            ssh -o StrictHostKeyChecking=no -i "$KEY" ubuntu@${BASTION_IP} "chmod 600 /tmp/rke2-key" 2>/dev/null
+            # Binary über Bastion auf Node kopieren
+            scp -o StrictHostKeyChecking=no -i "$KEY" \
+              -o ProxyCommand="ssh -o StrictHostKeyChecking=no -i $KEY -W %h:%p ubuntu@${BASTION_IP}" \
+              /tmp/geesefs ubuntu@${NODE_IP}:/tmp/geesefs 2>/dev/null
+            # Auf Node installieren (via Bastion)
+            ssh -o StrictHostKeyChecking=no -i "$KEY" ubuntu@${BASTION_IP} \
+              "ssh -o StrictHostKeyChecking=no -i /tmp/rke2-key ubuntu@${NODE_IP} \
+              'sudo install -m755 /tmp/geesefs /usr/local/bin/geesefs && \
+               sudo ln -sf /usr/local/bin/geesefs /usr/bin/geesefs && \
+               grep -q user_allow_other /etc/fuse.conf 2>/dev/null || \
+               echo user_allow_other | sudo tee -a /etc/fuse.conf && \
+               geesefs --version 2>&1 | head -1'" 2>/dev/null \
+            && echo "  ✅ ${NODE_IP} geesefs OK" \
+            || echo "  ⚠️  ${NODE_IP} geesefs install failed"
+          }
+
+          install_geesefs "${MASTER_IP}"
+
+          WORKERS=$(echo "${WORKER_IPS_JSON}" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin)))" 2>/dev/null || echo "")
+          for W_IP in $WORKERS; do
+            install_geesefs "$W_IP"
+          done
+
+          # CSI-S3 DaemonSet restart damit neue fuse.conf + geesefs gilt
+          kubectl --insecure-skip-tls-verify rollout restart daemonset/csi-s3 -n kube-system 2>/dev/null || true
+          echo "✅ geesefs install complete — CSI-S3 restarted"
+
+      - name: Wait for RKE2 master ready
+        run: |
+          echo "⏳ Polling RKE2 server on $MASTER_IP (via $BASTION_IP)..."
+          READY=false
+          for i in $(seq 1 40); do
+            STATUS=$(ssh -F ~/.ssh/config ubuntu@$MASTER_IP \
+              'sudo systemctl is-active rke2-server 2>/dev/null' 2>/dev/null || echo "unreachable")
+            echo "  [$(date +%H:%M:%S)] attempt $i/40 — rke2-server: $STATUS"
+            if [ "$STATUS" = "active" ]; then
+              READY=true
+              break
+            fi
+            sleep 15
+          done
+          $READY || { echo "❌ RKE2 master never became active"; exit 1; }
+          echo "✅ RKE2 master is active"
+
+      # ── Fetch kubeconfig + SSH tunnel ─────────────────
+      # The Kubernetes API (6443) is only reachable inside the OTC VPC.
+      # We open a local SSH tunnel: localhost:6443 → MASTER_IP:6443 via Bastion
+      # and rewrite the kubeconfig server URL to use 127.0.0.1.
+      - name: Fetch kubeconfig + open API tunnel
+        run: |
+          # Fetch raw kubeconfig from master
+          ssh -F ~/.ssh/config ubuntu@$MASTER_IP \
+            'sudo cat /etc/rancher/rke2/rke2.yaml' \
+            | sed "s|server: https://127\.0\.0\.1:6443|server: https://127.0.0.1:6443|g" \
+            > /tmp/kubeconfig
+          chmod 600 /tmp/kubeconfig
+
+          # Open persistent SSH tunnel: localhost:6443 → master:6443 via bastion
+          ssh -F ~/.ssh/config \
+            -L 6443:${MASTER_IP}:6443 \
+            -N -f -o ExitOnForwardFailure=yes \
+            ubuntu@$BASTION_IP
+          sleep 3
+          echo "✅ SSH tunnel localhost:6443 → $MASTER_IP:6443 established"
+
+          # Verify connectivity
+          KUBECONFIG=/tmp/kubeconfig kubectl --insecure-skip-tls-verify get nodes -o wide
+          echo "KUBECONFIG=/tmp/kubeconfig" >> $GITHUB_ENV
+
+      # ── Deploy Cloud Manager ───────────────────────────
+      - uses: azure/setup-helm@v4
+        with:
+          version: "3.14.0"
+
+      - name: Deploy OTC Cloud Manager
+        env:
+          OTC_AK:          ${{ secrets.OTC_ACCESS_KEY }}
+          OTC_SK:          ${{ secrets.OTC_SECRET_KEY }}
+          OTC_PROJECT_ID:  ${{ secrets.OTC_PROJECT_ID }}
+          GHCR_PAT:        ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          # Create imagePullSecret for private GHCR package
+          kubectl --insecure-skip-tls-verify create secret docker-registry ghcr-pull-secret \
+            --namespace kube-system \
+            --docker-server=ghcr.io \
+            --docker-username=wolfslight-forgehouse \
+            --docker-password="$GHCR_PAT" \
+            --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f -
+
+          helm upgrade --install swiss-otc-ccm deploy/helm/swiss-otc-ccm/ \
+            --namespace kube-system \
+            --set cloudConfig.auth.accessKey="$OTC_AK" \
+            --set cloudConfig.auth.secretKey="$OTC_SK" \
+            --set cloudConfig.auth.projectId="$OTC_PROJECT_ID" \
+            --set cloudConfig.network.vpcId="$VPC_ID" \
+            --set cloudConfig.network.subnetId="$SUBNET_ID" \
+            --set cloudConfig.network.networkId="$NETWORK_ID" \
+            --set imagePullSecrets[0].name=ghcr-pull-secret \
+            --insecure-skip-tls-verify \
+            --wait --timeout=10m
+          echo "✅ Cloud Manager deployed"
+          kubectl --insecure-skip-tls-verify get pods -n kube-system \
+            -l app.kubernetes.io/name=swiss-otc-ccm
+
+
+
+      # ── Deploy Kube-OVN CNI (nur wenn CNI_PLUGIN=kube-ovn) ──────────────
+      - name: Deploy Kube-OVN CNI
+        if: ${{ vars.CNI_PLUGIN == 'kube-ovn' }}
+        run: |
+          echo "🌐 Deploying Kube-OVN CNI (overlay mode)..."
+          MASTER_IP_ESCAPED=$(echo "$MASTER_IP" | tr '.' ',')
+
+          helm repo add kubeovn https://kubeovn.github.io/kube-ovn
+          helm repo update
+
+          # Kube-OVN Overlay Mode — keine OTC VPC Abhängigkeiten
+          # Bootstrap Fix: kube-ovn/role=master Label auf Master setzen
+          # ovn-central wird nur auf Nodes mit diesem Label scheduled
+          MASTER_HOSTNAME=$(kubectl --insecure-skip-tls-verify get nodes \
+            -o jsonpath='{.items[?(@.metadata.labels.node-role\.kubernetes\.io/control-plane)].metadata.name}' \
+            2>/dev/null | awk '{print $1}')
+          echo "Master Node: $MASTER_HOSTNAME"
+          kubectl --insecure-skip-tls-verify label node "$MASTER_HOSTNAME" \
+            kube-ovn/role=master --overwrite || true
+
+          # RKE2-spezifische Pfade:
+          # - kubelet-dir: /var/lib/rancher/rke2/agent/kubelet (nicht /var/lib/kubelet)
+          # - CNI bin: /var/lib/rancher/rke2/data/current/bin (RKE2 embedded)
+          # - CNI conf: /var/lib/rancher/rke2/agent/etc/cni/net.d
+          # Diese sind kritisch damit kube-ovn-cni Ready wird!
+          RKE2_DATA=$(ls -d /var/lib/rancher/rke2/data/v*/bin 2>/dev/null | head -1 || echo "/var/lib/rancher/rke2/data/current/bin")
+          
+          helm upgrade --install kube-ovn kubeovn/kube-ovn \
+            --namespace kube-system \
+            --version 1.13.0 \
+            --set replicaCount=1 \
+            --set MASTER_NODES="$MASTER_IP" \
+            --set networking.networkType=geneve \
+            --set networking.defaultSubnet=10.244.0.0/16 \
+            --set networking.defaultGateway=10.244.0.1 \
+            --set networking.joinSubnet=100.64.0.0/16 \
+            --set networking.nodeSwitchCIDR=100.64.0.0/16 \
+            --set func.NP_IMPLEMENTATION=iptables \
+            --set func.ENABLE_LB=true \
+            --set func.ENABLE_NP=true \
+            --set "ovn-central.requests.cpu=100m" \
+            --set "ovn-central.requests.memory=100Mi" \
+            --set "ovn-central.limits.cpu=1" \
+            --set "ovn-central.limits.memory=1Gi" \
+            --set "kubelet_conf.KUBELET_DIR=/var/lib/rancher/rke2/agent/kubelet" \
+            --set "cni_conf.CNI_CONF_DIR=/var/lib/rancher/rke2/agent/etc/cni/net.d" \
+            --set "cni_conf.CNI_BIN_DIR=/opt/cni/bin" \
+            --insecure-skip-tls-verify
+
+          # Bootstrap Fix: ovn-central CPU patch + CNI Pod Neustart
+          echo "⏳ Warte kurz auf Deployment..."
+          sleep 15
+
+          echo "Patching ovn-central CPU resources..."
+          kubectl --insecure-skip-tls-verify patch deployment ovn-central -n kube-system \
+            --type strategic \
+            --patch '{"spec":{"template":{"spec":{"containers":[{"name":"ovn-central","resources":{"requests":{"cpu":"100m","memory":"100Mi"},"limits":{"cpu":"1","memory":"1Gi"}}}]}}}}' \
+            2>/dev/null && echo "✅ ovn-central CPU patched" || echo "⚠️ patch attempt done"
+
+          # Warte auf Kube-OVN pods
+          echo "⏳ Warte auf Kube-OVN pods..." 
+          for i in $(seq 1 30); do
+            READY=$(kubectl --insecure-skip-tls-verify get pods -n kube-system \
+              -l app=kube-ovn-cni --no-headers 2>/dev/null | grep -c "Running" || echo "0")
+            echo "  [$i/30] kube-ovn-cni Running: ${READY}"
+            [ "${READY:-0}" -ge 1 ] && break
+            sleep 10
+          done
+
+          # Warte bis kube-ovn-cni DaemonSet READY ist (nicht nur Running!)
+          # kube-ovn-cni 0/1 = kein CNI = alle weiteren Pods ContainerCreating
+          echo "⏳ Warte auf kube-ovn-cni Ready + Nodes Ready..."
+          for i in $(seq 1 40); do
+            CNI_DESIRED=$(kubectl --insecure-skip-tls-verify get ds kube-ovn-cni -n kube-system \
+              -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
+            CNI_READY=$(kubectl --insecure-skip-tls-verify get ds kube-ovn-cni -n kube-system \
+              -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+            NODE_READY=$(kubectl --insecure-skip-tls-verify get nodes --no-headers 2>/dev/null | \
+              grep -c " Ready " || echo "0")
+            echo "  [$i/40] kube-ovn-cni: ${CNI_READY}/${CNI_DESIRED} Ready | Nodes: ${NODE_READY}"
+            [ "${CNI_READY:-0}" -ge "${CNI_DESIRED:-99}" ] && \
+            [ "${CNI_DESIRED:-0}" -ge 1 ] && \
+            [ "${NODE_READY:-0}" -ge 3 ] && break
+            sleep 10
+          done
+
+          echo "✅ Kube-OVN deployed + CNI Ready"
+          kubectl --insecure-skip-tls-verify get pods -n kube-system | grep -E "kube-ovn|ovn"
+
+      # ── Deploy Cinder CSI (EVS Storage) ─────────────────
+
+      - name: Pre-pull CSI images on nodes
+        run: |
+          echo "🔄 Pre-pulling CSI images auf allen Nodes..."
+          
+          # Images aus dem Cinder CSI Controller (die nicht vom nodeplugin gecached werden)
+          IMAGES=(
+            "registry.k8s.io/sig-storage/csi-attacher:v4.10.0"
+            "registry.k8s.io/sig-storage/csi-provisioner:v5.3.0"
+            "registry.k8s.io/sig-storage/csi-snapshotter:v8.4.0"
+            "registry.k8s.io/sig-storage/csi-resizer:v1.14.0"
+          )
+          
+          # CSI-S3 Image
+          CSI_S3_IMAGE=$(kubectl --insecure-skip-tls-verify get ds csi-s3 -n kube-system -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+          
+          WORKERS_JSON='${{ env.WORKER_IPS_JSON }}'
+          WORKERS=$(echo $WORKERS_JSON | python3 -c "import sys,json; [print(x) for x in json.load(sys.stdin)]")
+          ALL_NODES="$MASTER_IP $WORKERS"
+          
+          for IMAGE in "${IMAGES[@]}"; do
+            echo "  Pulling: $IMAGE"
+            for NODE in $ALL_NODES; do
+              ssh -i /tmp/rke2-key                 -o StrictHostKeyChecking=no                 -o ProxyJump=ubuntu@${BASTION_IP}                 ubuntu@${NODE}                 "sudo crictl pull '$IMAGE'" &
+            done
+            wait
+            echo "  ✅ $IMAGE pulled"
+          done
+          
+          echo "✅ Pre-pull complete"
+
+      - name: Deploy Cinder CSI (EVS PVC Support)
+        env:
+          OTC_USERNAME:   ${{ secrets.OTC_USERNAME }}
+          OTC_PASSWORD:   ${{ secrets.OTC_PASSWORD }}
+          OTC_PROJECT_ID: ${{ secrets.OTC_PROJECT_ID }}
+          OTC_DOMAIN_NAME: ${{ secrets.OTC_DOMAIN_NAME }}
+        run: |
+          # cloud.conf für Swiss OTC EVS (Cinder CSI)
+          # endpoint-override nötig: EVS = https://evs.eu-ch2.sc.otc.t-systems.com/v3
+          printf '[Global]\nauth-url=https://iam-pub.eu-ch2.sc.otc.t-systems.com/v3\nusername=%s\npassword=%s\nregion=eu-ch2\ntenant-id=%s\ndomain-name=%s\n\n[BlockStorage]\nbs-version=v3\nendpoint-override=https://evs.eu-ch2.sc.otc.t-systems.com/v3/%s\n' \
+            "${OTC_USERNAME}" "${OTC_PASSWORD}" "${OTC_PROJECT_ID}" "${OTC_DOMAIN_NAME}" "${OTC_PROJECT_ID}" \
+            > /tmp/cinder-cloud.conf
+
+          kubectl --insecure-skip-tls-verify create secret generic cinder-csi-cloud-config \
+            --namespace kube-system \
+            --from-file=cloud.conf=/tmp/cinder-cloud.conf \
+            --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f -
+
+          helm repo add cpo https://kubernetes.github.io/cloud-provider-openstack
+          helm repo update
+
+          helm upgrade --install cinder-csi cpo/openstack-cinder-csi \
+            --namespace kube-system \
+            --version 2.35.0 \
+            -f deploy/helm/cinder-csi/values.yaml \
+            --set secret.create=false \
+            --set secret.enabled=true \
+            --set secret.name=cinder-csi-cloud-config \
+            --insecure-skip-tls-verify
+
+          # Warte bis Cinder CSI Pods ready (ohne --wait im helm)
+          echo "⏳ Warte auf Cinder CSI pods..."
+          for i in $(seq 1 20); do
+            READY=$(kubectl --insecure-skip-tls-verify get pods -n kube-system \
+              -l app=openstack-cinder-csi --no-headers 2>/dev/null | grep -c "Running" || echo "0")
+            echo "  [$i/20] Running pods: ${READY}"
+            [ "${READY:-0}" -ge 2 ] 2>/dev/null && break
+            sleep 15
+          done
+
+          # Warten bis Controller vollständig bereit
+          echo "⏳ Warte auf Cinder CSI Controller..."
+          for i in $(seq 1 30); do
+            # Controller hat 6 Container — warte bis alle ready (6/6)
+            CTRL_STATUS=$(kubectl --insecure-skip-tls-verify get pods -n kube-system \
+              --no-headers 2>/dev/null | \
+              grep "cinder-csi-controllerplugin" | head -1 | awk '{print $2}')
+            CTRL_READY=$(echo "$CTRL_STATUS" | grep -c "^[1-9][0-9]*/[1-9]" || echo "0")
+            echo "  [$i/30] Controller status: ${CTRL_STATUS:-not found}" 
+            echo "  [$i/20] Controller pods ready: ${CTRL_READY}"
+            [ "${CTRL_READY:-0}" -ge 1 ] && break
+            sleep 10
+          done
+          echo "✅ Cinder CSI deployed"
+          kubectl --insecure-skip-tls-verify get pods -n kube-system \
+            -l app=openstack-cinder-csi
+          kubectl --insecure-skip-tls-verify get sc
+
+
+      # ── Deploy CSI-S3 (OBS Object Storage) ────────────
+      - name: Deploy CSI-S3 (OBS ReadWriteMany Storage)
+        env:
+          OTC_AK:   ${{ secrets.OTC_ACCESS_KEY }}
+          OTC_SK:   ${{ secrets.OTC_SECRET_KEY }}
+          GHCR_PAT: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          # imagePullSecret für GHCR (csi-s3-driver ist private package)
+          kubectl --insecure-skip-tls-verify create secret docker-registry ghcr-pull-secret \
+            --namespace kube-system \
+            --docker-server=ghcr.io \
+            --docker-username=wolfslight-forgehouse \
+            --docker-password="${GHCR_PAT}" \
+            --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f -
+
+          helm repo add csi-s3 https://yandex-cloud.github.io/k8s-csi-s3/charts 2>/dev/null || true
+          helm repo update
+
+          helm upgrade --install csi-s3 csi-s3/csi-s3 \
+            --namespace kube-system \
+            --version 0.43.4 \
+            -f deploy/helm/csi-s3/values.yaml \
+            --set secret.accessKey="${OTC_AK}" \
+            --set secret.secretKey="${OTC_SK}" \
+            --insecure-skip-tls-verify
+
+          # Patch 1: imagePullSecrets auf DaemonSet
+          DS_PATCH='[{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"ghcr-pull-secret"}]}]'
+          kubectl --insecure-skip-tls-verify patch daemonset csi-s3 -n kube-system --type=json -p="${DS_PATCH}"
+
+          # Patch 2: Provisioner socket-dir hostPath + imagePullSecrets
+          STS_PATCH='[{"op":"replace","path":"/spec/template/spec/volumes/0","value":{"name":"socket-dir","hostPath":{"path":"/var/lib/kubelet/plugins/ru.yandex.s3.csi","type":"DirectoryOrCreate"}}},{"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"ghcr-pull-secret"}]}]'
+          kubectl --insecure-skip-tls-verify patch statefulset csi-s3-provisioner -n kube-system --type=json -p="${STS_PATCH}"
+
+          # Warte bis Pods Ready (nach Patches)
+          echo "⏳ Warte auf csi-s3 Provisioner (master-only, Worker joinen später)..."
+          for i in $(seq 1 20); do
+            READY=$(kubectl --insecure-skip-tls-verify get pods -n kube-system \
+              -l app=csi-s3-provisioner --no-headers 2>/dev/null | grep -c "Running" || echo "0")
+            echo "  [$i/20] Provisioner Running: ${READY}"
+            [ "${READY:-0}" -ge 1 ] 2>/dev/null && break
+            sleep 15
+          done
+          kubectl --insecure-skip-tls-verify wait pod -n kube-system -l app=csi-s3-provisioner --for=condition=Ready --timeout=3m || true
+
+          echo "✅ CSI-S3 deployed"
+          kubectl --insecure-skip-tls-verify get pods -n kube-system | grep csi-s3
+          kubectl --insecure-skip-tls-verify get sc | grep obs
+
+      # ── Deploy Demo App + Storage PVCs ──────────────────
+      - name: Deploy Demo App + Storage Demo
+        run: |
+          # Demo App: Subnet-ID dynamisch setzen (frisch nach Terraform)
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/demo-app.yaml
+
+          # Subnet-ID Annotation nachpatchen (CCM braucht korrekte Subnet für ELB)
+          kubectl --insecure-skip-tls-verify annotate svc demo-lb \
+            otc.io/elb-virsubnet-id="${SUBNET_ID}" --overwrite
+
+          # ── Shared ELB Service annotieren ──────────────────
+          if [ -n "${SHARED_ELB_ID}" ]; then
+            echo "🔗 Annotating shared-elb-demo with ELB ID: ${SHARED_ELB_ID}"
+            kubectl --insecure-skip-tls-verify apply -f deploy/k8s/elb/shared-elb-demo-service.yaml 2>/dev/null || true
+            kubectl --insecure-skip-tls-verify annotate svc shared-elb-demo -n default \
+              "kubernetes.io/elb.id=${SHARED_ELB_ID}" \
+              "otc.io/elb-virsubnet-id=${SUBNET_ID}" \
+              --overwrite
+            echo "✅ shared-elb-demo → ELB ${SHARED_ELB_ID} (IP: ${SHARED_ELB_IP})"
+          else
+            echo "⚠️ SHARED_ELB_ID leer — shared-elb Modul noch nicht deployed"
+          fi
+
+          # ── Traefik Ingress Controller deployen (wenn DEPLOY_INGRESS=true) ──
+          if [ "${DEPLOY_INGRESS:-true}" = "true" ]; then
+          echo "🔧 Deploy Traefik 33.2.1..."
+          helm repo add traefik https://traefik.github.io/charts 2>/dev/null || true
+          helm repo update traefik 2>/dev/null || true
+
+          helm upgrade --install traefik traefik/traefik \
+            --namespace traefik --create-namespace \
+            --version 33.2.1 \
+            --set ingressClass.enabled=true \
+            --set ingressClass.isDefaultClass=true \
+            --set service.type=LoadBalancer \
+            --set providers.kubernetesIngress.enabled=true \
+            --set providers.kubernetesCRD.enabled=true \
+            --set logs.access.enabled=true \
+            --insecure-skip-tls-verify \
+            --wait --timeout 5m
+
+          echo "✅ Traefik deployed"
+          kubectl --insecure-skip-tls-verify get pods -n traefik --no-headers | head -5
+          kubectl --insecure-skip-tls-verify get ingressclass 2>/dev/null || true
+          else
+            echo "⏭️  Traefik deploy skipped (DEPLOY_INGRESS=false)"
+          fi
+
+          # Storage Demo: EVS PVC (Block) + OBS PVC (Object/S3)
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/storage/demo-evs-pvc.yaml
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/storage/demo-obs-pvc.yaml
+
+          # Warte auf EVS PVC Bind (sollte schnell gehen ~10s)
+          echo "⏳ Warte auf EVS PVC..."
+          for i in $(seq 1 12); do
+            STATUS=$(kubectl --insecure-skip-tls-verify get pvc demo-evs-pvc -o jsonpath='{.status.phase}' 2>/dev/null)
+            echo "  [$i/12] EVS PVC: ${STATUS:-Pending}"
+            [ "${STATUS}" = "Bound" ] && break
+            sleep 10
+          done
+
+          # OBS PVC Status (kann länger dauern weil geesefs)
+          echo "⏳ Warte auf OBS PVC..."
+          for i in $(seq 1 12); do
+            STATUS=$(kubectl --insecure-skip-tls-verify get pvc demo-obs-pvc -o jsonpath='{.status.phase}' 2>/dev/null)
+            echo "  [$i/12] OBS PVC: ${STATUS:-Pending}"
+            [ "${STATUS}" = "Bound" ] && break
+            sleep 10
+          done
+
+          echo "✅ Storage deployed"
+          kubectl --insecure-skip-tls-verify get pvc
+
+          echo "⏳ Waiting for ELB External-IP (OTC ELB v3 provisioning ~2 min)..."
+          for i in $(seq 1 90); do
+            EXT_IP=$(kubectl --insecure-skip-tls-verify get svc -A \
+              -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.status.loadBalancer.ingress[0].ip}{end}' \
+              2>/dev/null)
+            if [ -n "$EXT_IP" ]; then
+              echo "✅ ELB External-IP: $EXT_IP"
+              echo "ELB_IP=$EXT_IP" >> $GITHUB_ENV
+              break
+            fi
+            echo "  Attempt $i/36 — waiting 10s..."
+            sleep 10
+          done
+
+
+      
+      # ── Cert-Manager (SDE-279) ────────────────────────
+      - name: Deploy Cert-Manager (TLS)
+        run: |
+          echo "🔒 Deploying cert-manager v1.16.0..."
+          helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
+          helm repo update jetstack 2>/dev/null || true
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            --namespace cert-manager --create-namespace \
+            --version v1.16.0 \
+            --set installCRDs=true \
+            --insecure-skip-tls-verify \
+            --wait --timeout 5m
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/cert-manager/cluster-issuers.yaml
+          echo "✅ Cert-Manager deployed"
+          kubectl --insecure-skip-tls-verify get clusterissuers 2>/dev/null || true
+
+      # ── ArgoCD (SDE-278) ──────────────────────────────
+      - name: Deploy ArgoCD (GitOps)
+        run: |
+          echo "🔄 Deploying ArgoCD 7.7.0..."
+          helm repo add argo https://argoproj.github.io/argo-helm 2>/dev/null || true
+          helm repo update argo 2>/dev/null || true
+          helm upgrade --install argocd argo/argo-cd \
+            --namespace argocd --create-namespace \
+            --version 7.7.0 \
+            --set server.insecure=true \
+            --insecure-skip-tls-verify \
+            --wait --timeout 8m
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/argocd/ingress.yaml
+          ARGOCD_PWD=$(kubectl --insecure-skip-tls-verify get secret argocd-initial-admin-secret \
+            -n argocd -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || echo "pending")
+          echo "✅ ArgoCD deployed (admin pw: ${ARGOCD_PWD})"
+          kubectl --insecure-skip-tls-verify get pods -n argocd --no-headers | head -8
+
+          # GitOps: AppProjects + App-of-Apps bootstrappen
+          echo "🔄 Bootstrapping GitOps (App-of-Apps)..."
+          kubectl --insecure-skip-tls-verify apply -f argocd/projects/infrastructure.yaml
+          kubectl --insecure-skip-tls-verify apply -f argocd/projects/workloads.yaml
+          kubectl --insecure-skip-tls-verify apply -f argocd/apps/root.yaml
+          kubectl --insecure-skip-tls-verify apply -f argocd/appsets/workloads-appset.yaml
+          echo "✅ GitOps bootstrapped — App-of-Apps aktiv"
+          kubectl --insecure-skip-tls-verify get applications -n argocd 2>/dev/null || true
+
+      # ── kube-prometheus-stack (SDE-281) ───────────────
+      - name: Deploy kube-prometheus-stack (Monitoring)
+        run: |
+          echo "📊 Deploying kube-prometheus-stack 67.0.0..."
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null || true
+          helm repo update prometheus-community 2>/dev/null || true
+          helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+            --namespace monitoring --create-namespace \
+            --version 67.0.0 \
+            --set grafana.adminPassword=admin \
+            --set grafana.ingress.enabled=true \
+            --set grafana.ingress.ingressClassName=traefik \
+            --set grafana.ingress.hosts='{grafana.sotc.internal}' \
+            --set prometheus.prometheusSpec.retention=7d \
+            --insecure-skip-tls-verify \
+            --wait --timeout 10m
+          echo "✅ kube-prometheus-stack deployed"
+          kubectl --insecure-skip-tls-verify get pods -n monitoring --no-headers | head -8
+
+      # ── CloudNativePG (SDE-280) ───────────────────────
+      - name: Deploy CloudNativePG (PostgreSQL Operator)
+        run: |
+          echo "🐘 Deploying CloudNativePG 0.23.0..."
+          helm repo add cnpg https://cloudnative-pg.github.io/charts 2>/dev/null || true
+          helm repo update cnpg 2>/dev/null || true
+          helm upgrade --install cnpg cnpg/cloudnative-pg \
+            --namespace cnpg-system --create-namespace \
+            --version 0.23.0 \
+            --insecure-skip-tls-verify \
+            --wait --timeout 5m
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/postgres/demo-cluster.yaml
+          echo "✅ CloudNativePG deployed"
+          kubectl --insecure-skip-tls-verify get pods -n cnpg-system --no-headers | head -5
+
+
+
+      # ── Kyverno Policy Engine (SDE-285) ──────────────
+      - name: Deploy Kyverno (Policy Engine)
+        run: |
+          echo "🛡️  Deploying Kyverno 3.3.4..."
+          helm repo add kyverno https://kyverno.github.io/kyverno 2>/dev/null || true
+          helm repo update kyverno 2>/dev/null || true
+          helm upgrade --install kyverno kyverno/kyverno \
+            --namespace kyverno --create-namespace \
+            --version 3.3.4 \
+            --set admissionController.replicas=1 \
+            --insecure-skip-tls-verify \
+            --wait --timeout 5m
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/kyverno/cis-policies.yaml
+          echo "✅ Kyverno deployed + CIS Policies aktiv (Audit-Mode)"
+          kubectl --insecure-skip-tls-verify get clusterpolicies 2>/dev/null || true
+
+      # ── NetworkPolicies (SDE-286 CIS 5.3.2) ──────────
+      - name: Apply Default-Deny NetworkPolicies (CIS 5.3.2)
+        run: |
+          echo "🔒 Applying Default-Deny NetworkPolicies..."
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/networkpolicies/
+          echo "✅ NetworkPolicies applied"
+          kubectl --insecure-skip-tls-verify get networkpolicy -A 2>/dev/null || true
+
+      # ── CIS Benchmark Scanner (SDE-284) ──────────────
+      - name: Run CIS Benchmark (kube-bench)
+        run: |
+          echo "🔒 Running CIS Benchmark (kube-bench rke2-cis-1.7)..."
+
+          # Jobs deployen (Master + Workers)
+          kubectl --insecure-skip-tls-verify delete job kube-bench-cis kube-bench-workers             -n kube-system 2>/dev/null || true
+
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/kube-bench-job.yaml
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/kube-bench-workers-job.yaml
+          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/kube-bench-cronjob.yaml
+
+          # Auf Master-Job warten (max 3 Min)
+          echo "⏳ Warte auf kube-bench Master-Job..."
+          kubectl --insecure-skip-tls-verify wait job/kube-bench-cis             -n kube-system --for=condition=complete --timeout=3m 2>/dev/null ||           kubectl --insecure-skip-tls-verify wait job/kube-bench-cis             -n kube-system --for=condition=failed --timeout=3m 2>/dev/null || true
+
+          # Ergebnisse ausgeben (Text-Output, kein --json)
+          BENCH_POD=$(kubectl --insecure-skip-tls-verify get pods -n kube-system \
+            -l app=kube-bench -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+          if [ -n "$BENCH_POD" ]; then
+            echo "📋 CIS Benchmark Results (PASS/FAIL/WARN):"
+            kubectl --insecure-skip-tls-verify logs "$BENCH_POD" -n kube-system 2>/dev/null | \
+              grep -E "^\[PASS\]|^\[FAIL\]|^\[WARN\]|^==" | head -50 || true
+            echo ""
+            echo "📊 Summary:"
+            kubectl --insecure-skip-tls-verify logs "$BENCH_POD" -n kube-system 2>/dev/null | \
+              grep -E "total:" | tail -10 || true
+          else
+            echo "⚠️  kube-bench Pod nicht gefunden — CronJob läuft täglich 02:00"
+          fi

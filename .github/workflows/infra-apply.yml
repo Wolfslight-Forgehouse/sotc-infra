@@ -120,6 +120,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Platform repo contains deploy/, argocd/, and policy manifests
+      - uses: actions/checkout@v4
+        with:
+          repository: Wolfslight-Forgehouse/sotc-platform
+          path: sotc-platform
+
       # ── SSH Setup ──────────────────────────────────────
       # Problem history:
       #   - "Host key verification failed" → fixed by ssh-keyscan
@@ -292,7 +298,7 @@ jobs:
             --docker-password="$GHCR_PAT" \
             --dry-run=client -o yaml | kubectl --insecure-skip-tls-verify apply -f -
 
-          helm upgrade --install swiss-otc-ccm deploy/helm/swiss-otc-ccm/ \
+          helm upgrade --install swiss-otc-ccm sotc-platform/deploy/helm/swiss-otc-ccm/ \
             --namespace kube-system \
             --set cloudConfig.auth.accessKey="$OTC_AK" \
             --set cloudConfig.auth.secretKey="$OTC_SK" \
@@ -454,7 +460,7 @@ jobs:
           helm upgrade --install cinder-csi cpo/openstack-cinder-csi \
             --namespace kube-system \
             --version 2.35.0 \
-            -f deploy/helm/cinder-csi/values.yaml \
+            -f sotc-platform/deploy/helm/cinder-csi/values.yaml \
             --set secret.create=false \
             --set secret.enabled=true \
             --set secret.name=cinder-csi-cloud-config \
@@ -510,7 +516,7 @@ jobs:
           helm upgrade --install csi-s3 csi-s3/csi-s3 \
             --namespace kube-system \
             --version 0.43.4 \
-            -f deploy/helm/csi-s3/values.yaml \
+            -f sotc-platform/deploy/helm/csi-s3/values.yaml \
             --set secret.accessKey="${OTC_AK}" \
             --set secret.secretKey="${OTC_SK}" \
             --insecure-skip-tls-verify
@@ -542,7 +548,7 @@ jobs:
       - name: Deploy Demo App + Storage Demo
         run: |
           # Demo App: Subnet-ID dynamisch setzen (frisch nach Terraform)
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/demo-app.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/demo-app.yaml
 
           # Subnet-ID Annotation nachpatchen (CCM braucht korrekte Subnet für ELB)
           kubectl --insecure-skip-tls-verify annotate svc demo-lb \
@@ -551,7 +557,7 @@ jobs:
           # ── Shared ELB Service annotieren ──────────────────
           if [ -n "${SHARED_ELB_ID}" ]; then
             echo "🔗 Annotating shared-elb-demo with ELB ID: ${SHARED_ELB_ID}"
-            kubectl --insecure-skip-tls-verify apply -f deploy/k8s/elb/shared-elb-demo-service.yaml 2>/dev/null || true
+            kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/elb/shared-elb-demo-service.yaml 2>/dev/null || true
             kubectl --insecure-skip-tls-verify annotate svc shared-elb-demo -n default \
               "kubernetes.io/elb.id=${SHARED_ELB_ID}" \
               "otc.io/elb-virsubnet-id=${SUBNET_ID}" \
@@ -587,8 +593,8 @@ jobs:
           fi
 
           # Storage Demo: EVS PVC (Block) + OBS PVC (Object/S3)
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/storage/demo-evs-pvc.yaml
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/storage/demo-obs-pvc.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/storage/demo-evs-pvc.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/storage/demo-obs-pvc.yaml
 
           # Warte auf EVS PVC Bind (sollte schnell gehen ~10s)
           echo "⏳ Warte auf EVS PVC..."
@@ -639,7 +645,7 @@ jobs:
             --set installCRDs=true \
             --insecure-skip-tls-verify \
             --wait --timeout 5m
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/cert-manager/cluster-issuers.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/cert-manager/cluster-issuers.yaml
           echo "✅ Cert-Manager deployed"
           kubectl --insecure-skip-tls-verify get clusterissuers 2>/dev/null || true
 
@@ -655,7 +661,7 @@ jobs:
             --set server.insecure=true \
             --insecure-skip-tls-verify \
             --wait --timeout 8m
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/argocd/ingress.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/argocd/ingress.yaml
           ARGOCD_PWD=$(kubectl --insecure-skip-tls-verify get secret argocd-initial-admin-secret \
             -n argocd -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || echo "pending")
           echo "✅ ArgoCD deployed (admin pw: ${ARGOCD_PWD})"
@@ -663,10 +669,10 @@ jobs:
 
           # GitOps: AppProjects + App-of-Apps bootstrappen
           echo "🔄 Bootstrapping GitOps (App-of-Apps)..."
-          kubectl --insecure-skip-tls-verify apply -f argocd/projects/infrastructure.yaml
-          kubectl --insecure-skip-tls-verify apply -f argocd/projects/workloads.yaml
-          kubectl --insecure-skip-tls-verify apply -f argocd/apps/root.yaml
-          kubectl --insecure-skip-tls-verify apply -f argocd/appsets/workloads-appset.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/argocd/projects/infrastructure.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/argocd/projects/workloads.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/argocd/apps/root.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/argocd/appsets/workloads-appset.yaml
           echo "✅ GitOps bootstrapped — App-of-Apps aktiv"
           kubectl --insecure-skip-tls-verify get applications -n argocd 2>/dev/null || true
 
@@ -700,7 +706,7 @@ jobs:
             --version 0.23.0 \
             --insecure-skip-tls-verify \
             --wait --timeout 5m
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/postgres/demo-cluster.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/postgres/demo-cluster.yaml
           echo "✅ CloudNativePG deployed"
           kubectl --insecure-skip-tls-verify get pods -n cnpg-system --no-headers | head -5
 
@@ -718,7 +724,7 @@ jobs:
             --set admissionController.replicas=1 \
             --insecure-skip-tls-verify \
             --wait --timeout 5m
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/kyverno/cis-policies.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/security/kyverno/cis-policies.yaml
           echo "✅ Kyverno deployed + CIS Policies aktiv (Audit-Mode)"
           kubectl --insecure-skip-tls-verify get clusterpolicies 2>/dev/null || true
 
@@ -726,7 +732,7 @@ jobs:
       - name: Apply Default-Deny NetworkPolicies (CIS 5.3.2)
         run: |
           echo "🔒 Applying Default-Deny NetworkPolicies..."
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/networkpolicies/
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/security/networkpolicies/
           echo "✅ NetworkPolicies applied"
           kubectl --insecure-skip-tls-verify get networkpolicy -A 2>/dev/null || true
 
@@ -738,9 +744,9 @@ jobs:
           # Jobs deployen (Master + Workers)
           kubectl --insecure-skip-tls-verify delete job kube-bench-cis kube-bench-workers             -n kube-system 2>/dev/null || true
 
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/kube-bench-job.yaml
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/kube-bench-workers-job.yaml
-          kubectl --insecure-skip-tls-verify apply -f deploy/k8s/security/kube-bench-cronjob.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/security/kube-bench-job.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/security/kube-bench-workers-job.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/security/kube-bench-cronjob.yaml
 
           # Auf Master-Job warten (max 3 Min)
           echo "⏳ Warte auf kube-bench Master-Job..."

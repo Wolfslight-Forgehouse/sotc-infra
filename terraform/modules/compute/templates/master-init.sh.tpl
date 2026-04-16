@@ -52,11 +52,15 @@ MASTER_IP=$(hostname -I | awk '{print $1}')
 
 %{ if cni_plugin == "kube-ovn" }
 # ── Kube-OVN: RKE2 ohne built-in CNI, Kube-OVN via Pipeline deployen ──────
+# Note: kube-proxy STAYS ENABLED — Kube-OVN v1.13 iptables mode is NOT a
+# kube-proxy replacement. Without kube-proxy, kube-ovn-controller can't
+# reach kube-apiserver via ClusterIP (10.43.0.1) → CrashLoopBackOff.
+# Pre-create the CNI conf dir so kube-ovn-cni install doesn't fail.
+mkdir -p /var/lib/rancher/rke2/agent/etc/cni/net.d
 cat > /etc/rancher/rke2/config.yaml <<CONFIG
 token: ${cluster_token}
 cloud-provider-name: external
 cni: none
-disable-kube-proxy: true
 tls-san:
   - $MASTER_IP
 CONFIG

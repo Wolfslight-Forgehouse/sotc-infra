@@ -33,6 +33,10 @@ done
 # Install RKE2 agent
 curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE="agent" sh -
 
+# Pre-create CNI conf dir — kube-ovn-cni install fails if this doesn't exist
+# (RKE2 normally creates it when its own CNI runs, but with cni:none we need it upfront).
+mkdir -p /var/lib/rancher/rke2/agent/etc/cni/net.d
+
 # Configure agent
 mkdir -p /etc/rancher/rke2
 cat > /etc/rancher/rke2/config.yaml <<CONFIG

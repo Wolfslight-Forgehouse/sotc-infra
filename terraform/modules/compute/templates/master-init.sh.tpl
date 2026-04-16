@@ -55,8 +55,18 @@ MASTER_IP=$(hostname -I | awk '{print $1}')
 # Note: kube-proxy STAYS ENABLED — Kube-OVN v1.13 iptables mode is NOT a
 # kube-proxy replacement. Without kube-proxy, kube-ovn-controller can't
 # reach kube-apiserver via ClusterIP (10.43.0.1) → CrashLoopBackOff.
-# Pre-create the CNI conf dir so kube-ovn-cni install doesn't fail.
+# Pre-create the CNI conf dir so kube-ovn-cni install doesn't fail (SDE-297).
 mkdir -p /var/lib/rancher/rke2/agent/etc/cni/net.d
+
+# SDE-299: RKE2 v1.34+ kubelet reads CNI config from /etc/cni/net.d,
+# but KubeOVN Helm writes to CNI_CONF_DIR=/var/lib/rancher/rke2/agent/etc/cni/net.d.
+# Symlink so both paths resolve to the same directory — kubelet sees the conflist.
+mkdir -p /etc/cni
+# Remove existing /etc/cni/net.d if it's an empty directory (RKE2 didn't create it yet)
+[ -d /etc/cni/net.d ] && [ -z "$(ls -A /etc/cni/net.d 2>/dev/null)" ] && rmdir /etc/cni/net.d
+# Create symlink only if /etc/cni/net.d doesn't already exist
+[ ! -e /etc/cni/net.d ] && ln -sfn /var/lib/rancher/rke2/agent/etc/cni/net.d /etc/cni/net.d
+
 cat > /etc/rancher/rke2/config.yaml <<CONFIG
 token: ${cluster_token}
 cloud-provider-name: external

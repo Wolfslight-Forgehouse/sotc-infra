@@ -37,6 +37,14 @@ curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE="agent" sh -
 # (RKE2 normally creates it when its own CNI runs, but with cni:none we need it upfront).
 mkdir -p /var/lib/rancher/rke2/agent/etc/cni/net.d
 
+%{ if cni_plugin == "kube-ovn" }
+# SDE-299: Symlink /etc/cni/net.d → RKE2 path so kubelet can find KubeOVN's conflist.
+# See master-init for details.
+mkdir -p /etc/cni
+[ -d /etc/cni/net.d ] && [ -z "$(ls -A /etc/cni/net.d 2>/dev/null)" ] && rmdir /etc/cni/net.d
+[ ! -e /etc/cni/net.d ] && ln -sfn /var/lib/rancher/rke2/agent/etc/cni/net.d /etc/cni/net.d
+%{ endif }
+
 # Configure agent
 mkdir -p /etc/rancher/rke2
 cat > /etc/rancher/rke2/config.yaml <<CONFIG

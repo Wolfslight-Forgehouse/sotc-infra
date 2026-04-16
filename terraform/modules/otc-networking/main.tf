@@ -1,3 +1,12 @@
+terraform {
+  required_providers {
+    opentelekomcloud = {
+      source  = "opentelekomcloud/opentelekomcloud"
+      version = "~> 1.36"
+    }
+  }
+}
+
 resource "opentelekomcloud_vpc_v1" "main" {
   name = "${var.cluster_name}-vpc"
   cidr = var.vpc_cidr
@@ -12,9 +21,9 @@ resource "opentelekomcloud_vpc_subnet_v1" "main" {
 }
 
 resource "opentelekomcloud_networking_router_v2" "main" {
-  name                = "${var.cluster_name}-router"
-  admin_state_up      = true
-  external_network_id = data.opentelekomcloud_networking_network_v2.ext.id
+  name           = "${var.cluster_name}-router"
+  admin_state_up = true
+  external_gateway = data.opentelekomcloud_networking_network_v2.ext.id
 }
 
 data "opentelekomcloud_networking_network_v2" "ext" {
@@ -23,7 +32,7 @@ data "opentelekomcloud_networking_network_v2" "ext" {
 
 resource "opentelekomcloud_networking_router_interface_v2" "main" {
   router_id = opentelekomcloud_networking_router_v2.main.id
-  subnet_id = opentelekomcloud_vpc_subnet_v1.main.id
+  subnet_id = opentelekomcloud_vpc_subnet_v1.main.subnet_id
 }
 
 resource "opentelekomcloud_networking_secgroup_v2" "rke2" {

@@ -12,9 +12,10 @@ provider "opentelekomcloud" {
   access_key  = var.otc_access_key
   secret_key  = var.otc_secret_key
   domain_name = var.otc_domain_name
-  tenant_name = var.otc_project_id
+  tenant_name = var.otc_tenant_name
+  tenant_id   = var.otc_project_id
   region      = var.region
-  auth_url    = "https://iam.eu-ch2.otc.t-systems.com/v3"
+  auth_url    = "https://iam-pub.eu-ch2.sc.otc.t-systems.com/v3"
 }
 
 module "networking" {

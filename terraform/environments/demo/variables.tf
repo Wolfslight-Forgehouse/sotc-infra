@@ -16,7 +16,12 @@ variable "otc_domain_name" {
 }
 
 variable "otc_project_id" {
-  description = "OTC Project ID"
+  description = "OTC Project ID (UUID)"
+  type        = string
+}
+
+variable "otc_tenant_name" {
+  description = "OTC Tenant/Project Name (e.g. eu-ch2)"
   type        = string
 }
 

@@ -1,3 +1,12 @@
+terraform {
+  required_providers {
+    opentelekomcloud = {
+      source  = "opentelekomcloud/opentelekomcloud"
+      version = "~> 1.36"
+    }
+  }
+}
+
 locals {
   master_userdata = <<-USERDATA
     #!/bin/bash
@@ -24,13 +33,26 @@ locals {
   USERDATA
 }
 
+data "opentelekomcloud_images_image_v2" "ubuntu" {
+  name        = var.image_name
+  most_recent = true
+}
+
 resource "opentelekomcloud_compute_instance_v2" "master" {
   name            = "${var.cluster_name}-master"
-  image_name      = var.image_name
   flavor_name     = var.master_flavor
   key_pair        = var.key_pair
   security_groups = [var.secgroup_id]
   user_data       = local.master_userdata
+
+  block_device {
+    uuid                  = data.opentelekomcloud_images_image_v2.ubuntu.id
+    source_type           = "image"
+    destination_type      = "volume"
+    volume_size           = 50
+    boot_index            = 0
+    delete_on_termination = true
+  }
 
   network {
     uuid = var.subnet_id
@@ -54,10 +76,18 @@ resource "opentelekomcloud_compute_floatingip_associate_v2" "master" {
 resource "opentelekomcloud_compute_instance_v2" "worker" {
   count           = var.worker_count
   name            = "${var.cluster_name}-worker-${count.index + 1}"
-  image_name      = var.image_name
   flavor_name     = var.worker_flavor
   key_pair        = var.key_pair
   security_groups = [var.secgroup_id]
+
+  block_device {
+    uuid                  = data.opentelekomcloud_images_image_v2.ubuntu.id
+    source_type           = "image"
+    destination_type      = "volume"
+    volume_size           = 50
+    boot_index            = 0
+    delete_on_termination = true
+  }
 
   user_data = <<-USERDATA
     #!/bin/bash

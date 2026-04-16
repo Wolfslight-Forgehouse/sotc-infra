@@ -206,6 +206,22 @@ resource "opentelekomcloud_networking_secgroup_rule_v2" "geneve" {
 }
 
 # =====================================================
+# Kube-OVN specific — OVN Northbound/Southbound databases
+# Needed for kube-ovn-controller to reach ovn-central (6641 NB, 6642 SB).
+# Discovered in E2E re-test 2026-04-16 — controller CrashLoopBackOff
+# with "dial tcp 10.0.1.x:6641: i/o timeout" without these rules.
+# =====================================================
+resource "opentelekomcloud_networking_secgroup_rule_v2" "ovn_nbdb" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 6641
+  port_range_max    = 6642
+  remote_ip_prefix  = var.vpc_cidr
+  security_group_id = opentelekomcloud_networking_secgroup_v2.rke2.id
+}
+
+# =====================================================
 # Cilium specific
 # =====================================================
 resource "opentelekomcloud_networking_secgroup_rule_v2" "cilium_health" {

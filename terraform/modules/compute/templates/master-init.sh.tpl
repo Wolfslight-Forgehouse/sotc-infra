@@ -96,6 +96,19 @@ CILIUM
 echo "CNI: cilium (built-in)"
 %{ endif }
 
+# ── Disable built-in RKE2 components ───────────────────────────
+# Example: rke2-ingress-nginx is disabled by default — we prefer Traefik,
+# deployed separately via sotc-platform (ingress-nginx maintenance has slowed).
+%{ if length(disabled_components) > 0 }
+cat >> /etc/rancher/rke2/config.yaml <<DISABLED
+disable:
+%{ for component in disabled_components ~}
+  - ${component}
+%{ endfor ~}
+DISABLED
+echo "Disabled RKE2 components: ${join(", ", disabled_components)}"
+%{ endif }
+
 # user_allow_other für FUSE mounts (CSI-S3)
 grep -q "^user_allow_other" /etc/fuse.conf || echo "user_allow_other" >> /etc/fuse.conf
 

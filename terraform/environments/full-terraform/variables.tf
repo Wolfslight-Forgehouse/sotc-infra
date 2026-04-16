@@ -74,6 +74,16 @@ variable "cni_plugin" {
   description = "CNI plugin: 'cilium' (built-in) or 'kube-ovn' (deployed later)"
 }
 
+variable "disabled_components" {
+  type        = list(string)
+  default     = ["rke2-ingress-nginx"]
+  description = <<-DESC
+    RKE2 components to disable. Default: ['rke2-ingress-nginx'].
+    We prefer Traefik — deployed separately from sotc-platform.
+    Set to [] to keep all defaults, or add more components (e.g. rke2-snapshot-controller).
+  DESC
+}
+
 # Optional OBS credentials for geesefs download (cloud-init)
 variable "obs_access_key" {
   type      = string

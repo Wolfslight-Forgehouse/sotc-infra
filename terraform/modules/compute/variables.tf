@@ -78,3 +78,20 @@ variable "cni_plugin" {
     error_message = "cni_plugin must be 'cilium' or 'kube-ovn'."
   }
 }
+
+variable "disabled_components" {
+  type        = list(string)
+  description = <<-DESC
+    RKE2 built-in components to disable. Rendered as `disable:` in config.yaml.
+
+    rke2-ingress-nginx is disabled by default because ingress-nginx maintenance
+    has slowed and we prefer Traefik for new deployments (Traefik is deployed
+    separately via sotc-platform).
+
+    Available components to disable:
+      - rke2-canal, rke2-coredns, rke2-ingress-nginx, rke2-metrics-server,
+      - rke2-snapshot-controller, rke2-snapshot-controller-crd,
+      - rke2-snapshot-validation-webhook, rke2-runtimeclasses
+  DESC
+  default     = ["rke2-ingress-nginx"]
+}

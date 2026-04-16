@@ -59,10 +59,11 @@ module "compute" {
   worker_flavor = var.worker_flavor
   worker_count  = var.worker_count
 
-  cluster_token  = var.cluster_token
-  cni_plugin     = var.cni_plugin
-  obs_access_key = var.obs_access_key
-  obs_secret_key = var.obs_secret_key
+  cluster_token       = var.cluster_token
+  cni_plugin          = var.cni_plugin
+  disabled_components = var.disabled_components
+  obs_access_key      = var.obs_access_key
+  obs_secret_key      = var.obs_secret_key
 
   # Ensure NAT is ready before VMs boot — cloud-init needs internet
   depends_on = [module.networking]

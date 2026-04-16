@@ -8,9 +8,18 @@ Supports three deployment cases through shared Terraform modules with case-speci
 
 | Case | Entrypoint | Description |
 |------|-----------|-------------|
-| **Full Terraform** | `terraform/environments/demo/` | Greenfield: VPC + VMs + RKE2 bootstrap |
-| **Join Existing** | `environments/join-existing/` | Pre-deployed VMs: RKE2 config + join (WIP) |
-| **Rancher Managed** | `environments/rancher-managed/` | Networking only — Rancher creates VMs (WIP) |
+| **Full Terraform** | `terraform/environments/full-terraform/` | Greenfield: VPC + NAT Gateway + VMs + RKE2 bootstrap |
+| **Demo (Legacy)** | `terraform/environments/demo/` | Simplified variant — no NAT Gateway, older cloud-init |
+| **Join Existing** | `environments/join-existing/` | Pre-deployed VMs: RKE2 config + join via SSH |
+| **Rancher Managed** | `environments/rancher-managed/` | Networking only — Rancher creates VMs via node driver |
+
+## Default Configuration
+
+- **CNI:** Cilium with kube-proxy replacement (MTU 1450 for VXLAN overhead)
+- **Ingress:** Traefik (deployed from [sotc-platform](https://github.com/Wolfslight-Forgehouse/sotc-platform))
+  — `rke2-ingress-nginx` is **disabled by default** (ingress-nginx maintenance has slowed)
+- **Outbound:** NAT Gateway + Elastic IP — workers without Floating IPs still reach the internet
+- **Storage:** EVS block (via Cinder CSI) + OBS object (via CSI-S3/GeeseFS)
 
 ## Related Repositories
 

@@ -20,19 +20,37 @@ resource "opentelekomcloud_vpc_subnet_v1" "main" {
   dns_list   = ["100.125.4.25", "8.8.8.8"]
 }
 
-resource "opentelekomcloud_networking_router_v2" "main" {
-  name           = "${var.cluster_name}-router"
-  admin_state_up = true
-  external_gateway = data.opentelekomcloud_networking_network_v2.ext.id
+# ─────────────────────────────────────────────────────────
+# NAT Gateway + SNAT Rule + EIP
+# Provides outbound internet for VMs without Floating IPs.
+# OTC VPC subnets don't have automatic internet egress —
+# a NAT Gateway is the production-standard solution.
+# ─────────────────────────────────────────────────────────
+
+resource "opentelekomcloud_vpc_eip_v1" "nat" {
+  publicip {
+    type = "5_bgp"
+  }
+  bandwidth {
+    name        = "${var.cluster_name}-nat-eip"
+    size        = 100
+    share_type  = "PER"
+    charge_mode = "traffic"
+  }
 }
 
-data "opentelekomcloud_networking_network_v2" "ext" {
-  name = "admin_external_net"
+resource "opentelekomcloud_nat_gateway_v2" "main" {
+  name                = "${var.cluster_name}-nat"
+  description         = "NAT Gateway for ${var.cluster_name} cluster outbound traffic"
+  spec                = "1" # 1=small (10k sessions), 2=medium, 3=large, 4=xlarge
+  router_id           = opentelekomcloud_vpc_v1.main.id
+  internal_network_id = opentelekomcloud_vpc_subnet_v1.main.subnet_id
 }
 
-resource "opentelekomcloud_networking_router_interface_v2" "main" {
-  router_id = opentelekomcloud_networking_router_v2.main.id
-  subnet_id = opentelekomcloud_vpc_subnet_v1.main.subnet_id
+resource "opentelekomcloud_nat_snat_rule_v2" "main" {
+  nat_gateway_id = opentelekomcloud_nat_gateway_v2.main.id
+  network_id     = opentelekomcloud_vpc_subnet_v1.main.subnet_id
+  floating_ip_id = opentelekomcloud_vpc_eip_v1.nat.id
 }
 
 resource "opentelekomcloud_networking_secgroup_v2" "rke2" {

@@ -1,0 +1,30 @@
+# Copy to terraform.tfvars and fill in values.
+# NEVER commit terraform.tfvars to git!
+
+# ── OTC Credentials ─────────────────────────────────────
+access_key  = "AK..."
+secret_key  = "SK..."
+project_id  = "project-uuid-here"
+tenant_name = "eu-ch2"
+
+# ── SSH Access ──────────────────────────────────────────
+# Public key only — private stays in 1Password/agent
+ssh_public_key = "ssh-ed25519 AAAA... your-key"
+
+# ── RKE2 ────────────────────────────────────────────────
+# Generate: openssl rand -hex 32
+cluster_token = "generated-token-here"
+
+# ── Sizing ──────────────────────────────────────────────
+cluster_name  = "rke2-full"
+master_flavor = "s3.xlarge.4"
+worker_flavor = "s3.large.4"
+worker_count  = 2
+
+# CNI: "cilium" (built-in, recommended for test) or "kube-ovn"
+cni_plugin = "cilium"
+
+# ── Optional OBS credentials for geesefs binary download ──
+# Leave empty unless you need CSI-S3 storage support
+obs_access_key = ""
+obs_secret_key = ""

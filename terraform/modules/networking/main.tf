@@ -28,6 +28,51 @@ resource "opentelekomcloud_vpc_subnet_v1" "rke2" {
   }
 }
 
+# ─────────────────────────────────────────────────────────
+# NAT Gateway + SNAT Rule + EIP
+# Outbound internet for VMs without Floating IPs.
+# Enabled via var.enable_nat_gateway (default: true)
+# ─────────────────────────────────────────────────────────
+
+resource "opentelekomcloud_vpc_eip_v1" "nat" {
+  count = var.enable_nat_gateway ? 1 : 0
+
+  publicip {
+    type = "5_bgp"
+  }
+  bandwidth {
+    name        = "${var.cluster_name}-nat-eip"
+    size        = 100
+    share_type  = "PER"
+    charge_mode = "traffic"
+  }
+
+  lifecycle {
+    ignore_changes = [tags]
+  }
+}
+
+resource "opentelekomcloud_nat_gateway_v2" "main" {
+  count = var.enable_nat_gateway ? 1 : 0
+
+  name        = "${var.cluster_name}-nat"
+  description = "NAT Gateway for ${var.cluster_name} outbound traffic"
+  spec        = var.nat_gateway_spec
+  router_id   = opentelekomcloud_vpc_v1.rke2.id
+  # NOTE: `internal_network_id` expects the Neutron NETWORK ID, not subnet.
+  # vpc_subnet_v1.id is the VPC-level UUID which is what NAT Gateway accepts here.
+  internal_network_id = opentelekomcloud_vpc_subnet_v1.rke2.id
+}
+
+resource "opentelekomcloud_nat_snat_rule_v2" "main" {
+  count = var.enable_nat_gateway ? 1 : 0
+
+  nat_gateway_id = opentelekomcloud_nat_gateway_v2.main[0].id
+  # NAT SNAT rule takes the VPC subnet ID (not the Neutron subnet_id)
+  network_id     = opentelekomcloud_vpc_subnet_v1.rke2.id
+  floating_ip_id = opentelekomcloud_vpc_eip_v1.nat[0].id
+}
+
 resource "opentelekomcloud_networking_secgroup_v2" "rke2" {
   name        = "${var.cluster_name}-sg"
   description = "RKE2 cluster security group"
@@ -198,7 +243,27 @@ resource "opentelekomcloud_networking_secgroup_rule_v2" "icmp" {
 # SSH Keypair (shared by all compute resources)
 # Created here so it's available before any VMs spawn.
 # =====================================================
+# Validate: exactly one of ssh_public_key / existing_keypair_name must be set
+locals {
+  keypair_mode_valid = (var.ssh_public_key != "") != (var.existing_keypair_name != "")
+  use_existing_keypair = var.existing_keypair_name != ""
+}
+
+resource "terraform_data" "validate_keypair" {
+  count = local.keypair_mode_valid ? 0 : 1
+
+  lifecycle {
+    precondition {
+      condition     = local.keypair_mode_valid
+      error_message = "Exactly one of ssh_public_key or existing_keypair_name must be set."
+    }
+  }
+}
+
+# Create new keypair only if ssh_public_key is provided
 resource "opentelekomcloud_compute_keypair_v2" "rke2" {
+  count = local.use_existing_keypair ? 0 : 1
+
   name       = "${var.cluster_name}-key"
   public_key = var.ssh_public_key
 }

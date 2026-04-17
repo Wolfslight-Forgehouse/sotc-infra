@@ -548,7 +548,7 @@ jobs:
       - name: Deploy Demo App + Storage Demo
         run: |
           # Demo App: Subnet-ID dynamisch setzen (frisch nach Terraform)
-          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/k8s/demo-app.yaml
+          kubectl --insecure-skip-tls-verify apply -f sotc-platform/deploy/apps/demo-app/deployment.yaml
 
           # Subnet-ID Annotation nachpatchen (CCM braucht korrekte Subnet für ELB)
           kubectl --insecure-skip-tls-verify annotate svc demo-lb \
